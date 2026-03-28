@@ -1,0 +1,352 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace MultiThreadControlApp
+{
+    public enum WorkerState
+    {
+        Running,
+        Paused,
+        Stopping,
+        Stopped
+    }
+
+    public class DataMessage
+    {
+        public string DataType { get; set; }
+        public string Content { get; set; }
+        public string Response { get; set; }
+        public DateTime Timestamp { get; set; }
+        public bool RequiresResponse { get; set; }
+        public int Priority { get; set; }
+
+        public DataMessage(string dataType, string content, bool requiresResponse = false, int priority = 0)
+        {
+            DataType = dataType;
+            Content = content;
+            RequiresResponse = requiresResponse;
+            Timestamp = DateTime.Now;
+            Priority = priority;
+        }
+    }
+
+    public class WorkerThread
+    {
+        private Thread thread;
+        private CancellationTokenSource cts;
+        private ManualResetEvent pauseEvent;
+        private int counter;
+        private readonly int workerId;
+        private int speedMs;
+        private bool isRunning;
+        private readonly object lockObj = new object();
+        private readonly ConcurrentQueue<DataMessage> incomingDataQueue;
+        private readonly ConcurrentQueue<DataMessage> outgoingDataQueue;
+        private Dictionary<string, object> workerData;
+        private WorkerState currentState;
+        private readonly DateTime createdAt;
+        private DateTime? startedAt;
+        private int? clonedFrom;
+        private ThreadPriority currentPriority;
+
+        public event Action<int, WorkerState> OnStateChanged;
+        public event Action<int, int> OnCounterChanged;
+        public event Action<int, DataMessage> OnDataReceived;
+        public event Action<int, DataMessage> OnDataSent;
+        public event Action<int, ThreadPriority> OnPriorityChanged;
+
+        public bool IsAlive => thread != null && thread.IsAlive;
+        public int WorkerId => workerId;
+
+        public ThreadPriority Priority
+        {
+            get
+            {
+                try { return currentPriority; }
+                catch { return ThreadPriority.Normal; }
+            }
+            set
+            {
+                try
+                {
+                    currentPriority = value;
+                    if (thread != null && thread.IsAlive)
+                    {
+                        thread.Priority = value;
+                        OnPriorityChanged?.Invoke(workerId, value);
+                    }
+                }
+                catch (Exception) { }
+            }
+        }
+
+        public WorkerThread(int id, int speed)
+        {
+            workerId = id;
+            speedMs = speed;
+            counter = 0;
+            incomingDataQueue = new ConcurrentQueue<DataMessage>();
+            outgoingDataQueue = new ConcurrentQueue<DataMessage>();
+            workerData = new Dictionary<string, object>();
+            createdAt = DateTime.Now;
+            currentState = WorkerState.Stopped;
+            currentPriority = ThreadPriority.Normal;
+            InitializeWorkerData();
+        }
+
+        private void InitializeWorkerData()
+        {
+            workerData["Name"] = $"Поток-{workerId}";
+            workerData["CreatedAt"] = createdAt;
+            workerData["ProcessedItems"] = 0;
+            workerData["CustomValue"] = 0;
+            workerData["DataReceivedCount"] = 0;
+            workerData["DataSentCount"] = 0;
+        }
+
+        public void Start()
+        {
+            if (isRunning) return;
+
+            cts = new CancellationTokenSource();
+            pauseEvent = new ManualResetEvent(true);
+            isRunning = true;
+            startedAt = DateTime.Now;
+            currentState = WorkerState.Running;
+
+            thread = new Thread(Run)
+            {
+                Name = $"Worker-{workerId}",
+                IsBackground = true,
+                Priority = currentPriority
+            };
+            thread.Start();
+
+            OnStateChanged?.Invoke(workerId, WorkerState.Running);
+        }
+
+        public void SendData(string dataType, string data)
+        {
+            int commandPriority = (int)currentPriority;
+            var message = new DataMessage(dataType, data, true, commandPriority);
+            incomingDataQueue.Enqueue(message);
+            lock (lockObj)
+            {
+                workerData["DataReceivedCount"] = (int)workerData["DataReceivedCount"] + 1;
+            }
+        }
+
+        public void SendResponse(string responseData)
+        {
+            var message = new DataMessage("Ответ", responseData, false);
+            message.Response = responseData;
+            outgoingDataQueue.Enqueue(message);
+        }
+
+        public DataMessage ReceiveData()
+        {
+            if (outgoingDataQueue.TryDequeue(out var message))
+            {
+                lock (lockObj)
+                {
+                    workerData["DataSentCount"] = (int)workerData["DataSentCount"] + 1;
+                }
+                OnDataSent?.Invoke(workerId, message);
+                return message;
+            }
+            return null;
+        }
+
+        public WorkerThread Clone(int newWorkerId)
+        {
+            var cloned = new WorkerThread(newWorkerId, speedMs);
+            cloned.clonedFrom = workerId;
+            cloned.currentPriority = currentPriority;
+
+            lock (lockObj)
+            {
+                cloned.workerData = new Dictionary<string, object>(this.workerData);
+                cloned.workerData["Name"] = $"Поток-{newWorkerId} (клон {workerId})";
+                cloned.workerData["ClonedFrom"] = workerId;
+                cloned.workerData["ClonedAt"] = DateTime.Now;
+            }
+
+            return cloned;
+        }
+
+        public void Pause()
+        {
+            if (!isRunning) return;
+            pauseEvent?.Reset();
+            currentState = WorkerState.Paused;
+            OnStateChanged?.Invoke(workerId, WorkerState.Paused);
+        }
+
+        public void Resume()
+        {
+            if (!isRunning) return;
+            pauseEvent?.Set();
+            currentState = WorkerState.Running;
+            OnStateChanged?.Invoke(workerId, WorkerState.Running);
+        }
+
+        public void Stop()
+        {
+            if (!isRunning) return;
+            cts?.Cancel();
+            pauseEvent?.Set();
+            currentState = WorkerState.Stopping;
+            OnStateChanged?.Invoke(workerId, WorkerState.Stopping);
+        }
+
+        public void Join(int timeoutMs)
+        {
+            thread?.Join(timeoutMs);
+            if (thread != null && !thread.IsAlive)
+            {
+                currentState = WorkerState.Stopped;
+                OnStateChanged?.Invoke(workerId, WorkerState.Stopped);
+            }
+        }
+
+        public void UpdateSpeed(int newSpeed)
+        {
+            speedMs = newSpeed;
+        }
+
+        public object GetWorkerData(string key)
+        {
+            lock (lockObj) { return workerData.ContainsKey(key) ? workerData[key] : null; }
+        }
+
+        public void SetWorkerData(string key, object value)
+        {
+            lock (lockObj) { workerData[key] = value; }
+        }
+
+        public Dictionary<string, object> GetAllData()
+        {
+            lock (lockObj) { return new Dictionary<string, object>(workerData); }
+        }
+
+        public WorkerState GetCurrentState() => currentState;
+        public int GetCurrentCounter() { lock (lockObj) { return counter; } }
+        public int GetSpeed() => speedMs;
+        public DateTime GetCreatedAt() => createdAt;
+        public DateTime? GetStartedAt() => startedAt;
+        public int? GetClonedFrom() => clonedFrom;
+
+        private void ProcessIncomingData()
+        {
+            var tempList = new List<DataMessage>();
+            while (incomingDataQueue.TryDequeue(out var msg)) tempList.Add(msg);
+
+            tempList.Sort((a, b) =>
+            {
+                int pa = a.Priority, pb = b.Priority;
+                int wp = (int)currentPriority;
+                if (wp >= (int)ThreadPriority.AboveNormal) return -1;
+                if (wp <= (int)ThreadPriority.BelowNormal) return 1;
+                return pb.CompareTo(pa);
+            });
+
+            foreach (var msg in tempList)
+            {
+                OnDataReceived?.Invoke(workerId, msg);
+
+                int procDelay = 0;
+                switch (currentPriority)
+                {
+                    case ThreadPriority.Lowest: procDelay = 30; break;
+                    case ThreadPriority.BelowNormal: procDelay = 20; break;
+                    case ThreadPriority.Normal: procDelay = 10; break;
+                    case ThreadPriority.AboveNormal: procDelay = 5; break;
+                }
+                if (procDelay > 0) Thread.Sleep(procDelay);
+
+                switch (msg.DataType)
+                {
+                    case "Число":
+                        if (int.TryParse(msg.Content, out int val))
+                        {
+                            // Увеличиваем на 1
+                            int result = val + 1;
+                            lock (lockObj)
+                            {
+                                workerData["CustomValue"] = result;
+                                workerData["ProcessedItems"] = (int)workerData["ProcessedItems"] + 1;
+                            }
+                            SendResponse($"{val} + 1 = {result}");
+                        }
+                        else SendResponse($"Ошибка: '{msg.Content}' не число");
+                        break;
+
+                    case "Команда":
+                        switch (msg.Content.ToLower())
+                        {
+                            case "info":
+                                int curCnt;
+                                object stored;
+                                lock (lockObj)
+                                {
+                                    curCnt = counter;
+                                    stored = workerData["CustomValue"];
+                                }
+                                SendResponse($"Счётчик: {curCnt}, значение: {stored}");
+                                break;
+                            case "reset":
+                                lock (lockObj)
+                                {
+                                    counter = 0;
+                                    workerData["CustomValue"] = 0;
+                                }
+                                SendResponse("Сброс выполнен");
+                                break;
+                            default:
+                                SendResponse($"Неизвестно: {msg.Content}");
+                                break;
+                        }
+                        break;
+                }
+            }
+        }
+
+        private void Run()
+        {
+            while (!cts.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    ProcessIncomingData();
+                    var resp = ReceiveData();
+                    pauseEvent.WaitOne();
+                    if (cts.Token.IsCancellationRequested) break;
+
+                    lock (lockObj)
+                    {
+                        counter++;
+                        if (counter > 100) counter = 0;
+                    }
+                    OnCounterChanged?.Invoke(workerId, counter);
+
+                    int actualSleep = speedMs;
+                    switch (currentPriority)
+                    {
+                        case ThreadPriority.Lowest: actualSleep += 30; break;
+                        case ThreadPriority.BelowNormal: actualSleep += 15; break;
+                        case ThreadPriority.AboveNormal: actualSleep = Math.Max(10, actualSleep - 15); break;
+                        case ThreadPriority.Highest: actualSleep = Math.Max(10, actualSleep - 30); break;
+                    }
+                    Thread.Sleep(actualSleep);
+                }
+                catch (ThreadInterruptedException) { break; }
+                catch (Exception) { }
+            }
+            isRunning = false;
+            currentState = WorkerState.Stopped;
+            OnStateChanged?.Invoke(workerId, WorkerState.Stopped);
+        }
+    }
+}
