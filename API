@@ -1,0 +1,225 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+namespace MultiThreadControlApp
+{
+    public class WorkerInfo
+    {
+        public int Id { get; set; }
+        public string Name { get; set; }
+        public WorkerState State { get; set; }
+        public ThreadPriority Priority { get; set; }
+        public int CurrentCounter { get; set; }
+        public int SpeedMs { get; set; }
+        public DateTime CreatedAt { get; set; }
+        public DateTime? StartedAt { get; set; }
+        public Dictionary<string, object> CustomData { get; set; }
+        public bool IsAlive { get; set; }
+        public int? ClonedFrom { get; set; }
+    }
+
+    public class DataExchangeRecord
+    {
+        public DateTime Timestamp { get; set; }
+        public int WorkerId { get; set; }
+        public string Direction { get; set; }
+        public string DataType { get; set; }
+        public string Data { get; set; }
+    }
+
+    public class WorkerManager
+    {
+        private readonly ConcurrentDictionary<int, WorkerThread> workers;
+        private int nextWorkerId = 1;
+        private readonly object lockObj = new object();
+        private readonly List<DataExchangeRecord> dataExchangeHistory;
+        private readonly int maxHistorySize = 500;
+
+        public event Action<int, WorkerState> OnWorkerStateChanged;
+        public event Action<int, int> OnWorkerCounterChanged;
+        public event Action<int, DataMessage> OnDataReceived;
+        public event Action<int, DataMessage> OnDataSent;
+        public event Action<int, ThreadPriority> OnWorkerPriorityChanged;
+
+        public WorkerManager()
+        {
+            workers = new ConcurrentDictionary<int, WorkerThread>();
+            dataExchangeHistory = new List<DataExchangeRecord>();
+        }
+
+        public int CreateWorker(int speed = 50)
+        {
+            int workerId;
+            lock (lockObj) { workerId = nextWorkerId++; }
+
+            var worker = new WorkerThread(workerId, speed);
+            worker.OnStateChanged += (id, state) => OnWorkerStateChanged?.Invoke(id, state);
+            worker.OnCounterChanged += (id, cnt) => OnWorkerCounterChanged?.Invoke(id, cnt);
+            worker.OnPriorityChanged += (id, pri) => OnWorkerPriorityChanged?.Invoke(id, pri);
+            worker.OnDataReceived += (id, msg) =>
+            {
+                OnDataReceived?.Invoke(id, msg);
+                AddToHistory(id, "Родитель → Дочерний", msg.DataType, msg.Content);
+            };
+            worker.OnDataSent += (id, msg) =>
+            {
+                OnDataSent?.Invoke(id, msg);
+                AddToHistory(id, "Дочерний → Родитель", msg.DataType, msg.Content);
+            };
+
+            if (workers.TryAdd(workerId, worker))
+            {
+                worker.Start();
+                return workerId;
+            }
+            return -1;
+        }
+
+        public bool StopWorker(int workerId)
+        {
+            if (workers.TryGetValue(workerId, out var w)) { w.Stop(); return true; }
+            return false;
+        }
+        public bool PauseWorker(int workerId)
+        {
+            if (workers.TryGetValue(workerId, out var w)) { w.Pause(); return true; }
+            return false;
+        }
+        public bool ResumeWorker(int workerId)
+        {
+            if (workers.TryGetValue(workerId, out var w)) { w.Resume(); return true; }
+            return false;
+        }
+
+        public bool SetWorkerPriority(int workerId, ThreadPriority priority)
+        {
+            if (workers.TryGetValue(workerId, out var w) && w.IsAlive) { w.Priority = priority; return true; }
+            return false;
+        }
+        public bool SetWorkerSpeed(int workerId, int speedMs)
+        {
+            if (workers.TryGetValue(workerId, out var w)) { w.UpdateSpeed(speedMs); return true; }
+            return false;
+        }
+
+        public int CloneWorker(int sourceWorkerId)
+        {
+            if (workers.TryGetValue(sourceWorkerId, out var src))
+            {
+                int newId;
+                lock (lockObj) { newId = nextWorkerId++; }
+                var cloned = src.Clone(newId);
+
+                cloned.OnStateChanged += (id, state) => OnWorkerStateChanged?.Invoke(id, state);
+                cloned.OnCounterChanged += (id, cnt) => OnWorkerCounterChanged?.Invoke(id, cnt);
+                cloned.OnPriorityChanged += (id, pri) => OnWorkerPriorityChanged?.Invoke(id, pri);
+                cloned.OnDataReceived += (id, msg) =>
+                {
+                    OnDataReceived?.Invoke(id, msg);
+                    AddToHistory(id, "Родитель → Дочерний", msg.DataType, msg.Content);
+                };
+                cloned.OnDataSent += (id, msg) =>
+                {
+                    OnDataSent?.Invoke(id, msg);
+                    AddToHistory(id, "Дочерний → Родитель", msg.DataType, msg.Content);
+                };
+
+                if (workers.TryAdd(newId, cloned))
+                {
+                    cloned.Start();
+                    return newId;
+                }
+            }
+            return -1;
+        }
+
+        public bool SendDataToWorker(int workerId, string dataType, string data)
+        {
+            if (workers.TryGetValue(workerId, out var w) && w.IsAlive)
+            {
+                w.SendData(dataType, data);
+                return true;
+            }
+            return false;
+        }
+
+        public WorkerInfo GetWorkerInfo(int workerId)
+        {
+            if (workers.TryGetValue(workerId, out var w))
+            {
+                return new WorkerInfo
+                {
+                    Id = workerId,
+                    Name = w.GetWorkerData("Name")?.ToString() ?? $"Поток-{workerId}",
+                    State = w.GetCurrentState(),
+                    Priority = w.Priority,
+                    CurrentCounter = w.GetCurrentCounter(),
+                    SpeedMs = w.GetSpeed(),
+                    CreatedAt = w.GetCreatedAt(),
+                    StartedAt = w.GetStartedAt(),
+                    CustomData = w.GetAllData(),
+                    IsAlive = w.IsAlive,
+                    ClonedFrom = w.GetClonedFrom()
+                };
+            }
+            return null;
+        }
+
+        public List<WorkerInfo> GetAllWorkers()
+        {
+            return workers.Values.Where(w => w.IsAlive).Select(w => GetWorkerInfo(w.WorkerId)).Where(i => i != null).ToList();
+        }
+
+        public List<DataExchangeRecord> GetDataExchangeHistory(int workerId = 0)
+        {
+            lock (dataExchangeHistory)
+            {
+                if (workerId == 0) return dataExchangeHistory.ToList();
+                return dataExchangeHistory.Where(r => r.WorkerId == workerId).ToList();
+            }
+        }
+
+        public bool IsWorkerAlive(int workerId) => workers.TryGetValue(workerId, out var w) && w.IsAlive;
+        public void CleanupDeadWorkers()
+        {
+            var dead = workers.Where(kv => !kv.Value.IsAlive).Select(kv => kv.Key).ToList();
+            foreach (var id in dead) workers.TryRemove(id, out _);
+        }
+
+        public void PauseAllWorkers() { foreach (var w in workers.Values) w.Pause(); }
+        public void ResumeAllWorkers() { foreach (var w in workers.Values) w.Resume(); }
+        public void StopAllWorkers() { foreach (var w in workers.Values) w.Stop(); }
+        public void SetGlobalSpeed(int speedMs) { foreach (var w in workers.Values) w.UpdateSpeed(speedMs); }
+        public void SendDataToAllWorkers(string dataType, string data)
+        {
+            foreach (var w in workers.Values) if (w.IsAlive) w.SendData(dataType, data);
+            AddToHistory(0, "Родитель → Все", dataType, data);
+        }
+
+        public int GetActiveWorkersCount() => workers.Count(kv => kv.Value.IsAlive);
+        public void Shutdown()
+        {
+            StopAllWorkers();
+            foreach (var w in workers.Values) w.Join(1000);
+        }
+
+        private void AddToHistory(int workerId, string direction, string dataType, string data)
+        {
+            lock (dataExchangeHistory)
+            {
+                dataExchangeHistory.Insert(0, new DataExchangeRecord
+                {
+                    Timestamp = DateTime.Now,
+                    WorkerId = workerId,
+                    Direction = direction,
+                    DataType = dataType,
+                    Data = data
+                });
+                while (dataExchangeHistory.Count > maxHistorySize) dataExchangeHistory.RemoveAt(dataExchangeHistory.Count - 1);
+            }
+        }
+    }
+}
